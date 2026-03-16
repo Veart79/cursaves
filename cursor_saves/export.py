@@ -15,13 +15,18 @@ def get_workspace_conversations(
     project_path: str,
     workspace_dir: Optional[Path] = None,
 ) -> list[dict]:
-    """Get the list of conversations for a project from its workspace DB.
+    """Get the list of conversations for a project.
+
+    Reads allComposers from the workspace DB first (fast path). If the
+    workspace DB is stale — which happens when Cursor stops updating
+    allComposers for inactive or SSH-remote workspaces — falls back to
+    scanning the global DB for conversations whose data references the
+    project path.
 
     If workspace_dir is provided, only reads from that specific workspace
     (avoids cross-host contamination for SSH workspaces with the same path).
 
-    Returns the allComposers array from composer.composerData, enriched
-    with the workspace directory path.
+    Returns a list of composer summary dicts enriched with _workspaceDir.
     """
     if workspace_dir is not None:
         ws_dirs = [workspace_dir]
@@ -51,11 +56,80 @@ def get_workspace_conversations(
                     c["_workspaceDir"] = str(ws_dir)
                     all_conversations.append(c)
 
-    # Sort by creation time, newest first
+    # Always check globalStorage for conversations that aren't in
+    # allComposers. Cursor >= ~0.45 often stops updating allComposers
+    # in workspace DBs (especially SSH-remote or inactive workspaces),
+    # so relying solely on allComposers misses the majority of chats.
+    global_convos = _discover_from_global_db(project_path, seen_ids)
+    if global_convos:
+        ws_dir_str = str(ws_dirs[0]) if ws_dirs else ""
+        for c in global_convos:
+            c["_workspaceDir"] = ws_dir_str
+        all_conversations.extend(global_convos)
+
     all_conversations.sort(
         key=lambda c: c.get("createdAt", 0), reverse=True
     )
     return all_conversations
+
+
+def _discover_from_global_db(
+    project_path: str,
+    exclude_ids: set[str],
+) -> list[dict]:
+    """Scan globalStorage for conversations belonging to a project.
+
+    Cursor >= ~0.45 (late 2025) sometimes stops updating allComposers in
+    workspace DBs, especially for SSH-remote or infrequently-opened
+    workspaces. The conversations still exist in globalStorage under
+    composerData:{id} keys with file paths embedded in the JSON values.
+
+    This function uses a SQL LIKE query on the project path to find
+    matching conversations, then builds lightweight summary dicts
+    compatible with the allComposers format.
+    """
+    global_db = paths.get_global_db_path()
+    if not global_db.exists():
+        return []
+
+    target = os.path.normpath(os.path.expanduser(project_path))
+
+    conversations = []
+    with db.CursorDB(global_db, readonly=True) as cdb:
+        rows = cdb.query(
+            "SELECT key, value FROM cursorDiskKV "
+            "WHERE key LIKE 'composerData:%' AND value LIKE ?",
+            (f"%{target}%",),
+        )
+        for key, value in rows:
+            cid = key.split(":", 1)[1]
+            if cid in exclude_ids:
+                continue
+            try:
+                raw = value if isinstance(value, str) else value.decode("utf-8", errors="replace")
+                data = json.loads(raw)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+
+            conversations.append({
+                "type": "head",
+                "composerId": cid,
+                "lastUpdatedAt": data.get("lastUpdatedAt", data.get("createdAt", 0)),
+                "createdAt": data.get("createdAt", 0),
+                "unifiedMode": data.get("unifiedMode", "agent"),
+                "forceMode": data.get("forceMode", ""),
+                "hasUnreadMessages": False,
+                "totalLinesAdded": data.get("totalLinesAdded", 0),
+                "totalLinesRemoved": data.get("totalLinesRemoved", 0),
+                "filesChangedCount": data.get("filesChangedCount", 0),
+                "subtitle": data.get("subtitle", ""),
+                "isArchived": data.get("isArchived", False),
+                "isDraft": data.get("isDraft", False),
+                "name": data.get("name", "Untitled"),
+                "_discoveredFromGlobal": True,
+            })
+
+    return conversations
 
 
 def get_conversation_data(composer_id: str) -> Optional[dict]:
@@ -193,20 +267,23 @@ def list_conversations(
     results = []
     global_db = paths.get_global_db_path()
 
-    # Single DB connection for all lookups
-    with db.CursorDB(global_db) as cdb:
+    with db.CursorDB(global_db, readonly=True) as cdb:
         for c in conversations:
             composer_id = c.get("composerId", "unknown")
 
             msg_count = 0
+            name = c.get("name", "Untitled")
             conv_data = cdb.get_json(f"composerData:{composer_id}")
             if conv_data:
                 headers = conv_data.get("fullConversationHeadersOnly", [])
                 msg_count = len(headers)
+                global_name = conv_data.get("name")
+                if global_name and global_name not in ("?", ""):
+                    name = global_name
 
             results.append({
                 "id": composer_id,
-                "name": c.get("name", "Untitled"),
+                "name": name or "Untitled",
                 "date": format_timestamp(c.get("createdAt", 0)),
                 "lastUpdated": format_timestamp(c.get("lastUpdatedAt", c.get("createdAt", 0))),
                 "mode": c.get("unifiedMode", c.get("forceMode", "unknown")),

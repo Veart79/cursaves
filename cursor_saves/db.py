@@ -11,30 +11,46 @@ from typing import Any, Optional
 class CursorDB:
     """Safe interface to a Cursor state.vscdb database.
 
-    All reads are performed on a temporary copy of the database to avoid
-    locking conflicts with a running Cursor instance. Writes operate on
-    the original file and require Cursor to be closed.
+    By default, reads are performed on a temporary copy of the database
+    to avoid locking conflicts with a running Cursor instance.
+
+    Pass readonly=True to skip the copy and open a direct read-only
+    connection instead — dramatically faster for large databases
+    (seconds vs. minutes for a 1 GB global DB), at the cost of
+    occasionally seeing a slightly stale snapshot if Cursor is
+    actively writing.
+
+    Writes operate on the original file and require Cursor to be closed.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, readonly: bool = False):
         self.db_path = db_path
+        self._readonly = readonly
         self._tmp_path: Optional[Path] = None
         self._conn: Optional[sqlite3.Connection] = None
 
     def _ensure_read_copy(self) -> sqlite3.Connection:
-        """Copy the database to a temp file and open a read-only connection."""
+        """Get a read connection to the database.
+
+        In readonly mode, opens a direct read-only URI connection
+        (no file copy, uses the OS page cache). Otherwise, copies
+        the database to a temp directory first.
+        """
         if self._conn is not None:
             return self._conn
 
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
-        # Copy the main db file and any WAL/SHM files
+        if self._readonly:
+            uri = f"file:{self.db_path}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True)
+            return self._conn
+
         tmp_dir = tempfile.mkdtemp(prefix="cursaves-")
         tmp_db = Path(tmp_dir) / "state.vscdb"
         shutil.copy2(self.db_path, tmp_db)
 
-        # Also copy WAL and SHM if they exist (needed for recent writes)
         for suffix in ("-wal", "-shm"):
             wal_file = self.db_path.parent / (self.db_path.name + suffix)
             if wal_file.exists():
@@ -42,11 +58,10 @@ class CursorDB:
 
         self._tmp_path = tmp_db
         self._conn = sqlite3.connect(str(tmp_db))
-        # Checkpoint WAL into main db for consistent reads
         try:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.OperationalError:
-            pass  # Not in WAL mode, that's fine
+            pass
         return self._conn
 
     def close(self):
@@ -128,6 +143,19 @@ class CursorDB:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
+
+    def query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        """Execute a read-only SQL query and return all rows.
+
+        Runs against the temp copy, so it's safe to use while Cursor
+        is open. Useful for queries that don't fit the simple get/list
+        pattern (e.g. LIKE searches across values).
+        """
+        conn = self._ensure_read_copy()
+        try:
+            return conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return []
 
     # ── Write operations (on original file) ─────────────────────────
 

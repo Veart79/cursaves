@@ -234,27 +234,80 @@ def list_all_workspaces() -> list[dict]:
 def list_workspaces_with_conversations() -> list[dict]:
     """List workspaces that have at least one conversation.
 
+    First checks allComposers in the workspace DB (fast). If the
+    workspace DB appears stale (only stub entries with name "?"),
+    falls back to scanning globalStorage for conversations that
+    reference the workspace's project path.
+
     Returns the same dicts as list_all_workspaces(), plus a
     'conversations' key with the count.
     """
     from . import db
 
+    all_ws = list_all_workspaces()
     result = []
-    for ws in list_all_workspaces():
+    need_global = []
+
+    for ws in all_ws:
         db_path = ws["workspace_dir"] / "state.vscdb"
         if not db_path.exists():
             continue
         try:
             with db.CursorDB(db_path) as cdb:
                 data = cdb.get_json("composer.composerData", table="ItemTable")
+                ws_count = 0
                 if data:
                     composers = data.get("allComposers", [])
-                    if composers:
-                        ws["conversations"] = len(composers)
-                        result.append(ws)
+                    has_real = any(
+                        c.get("name") not in (None, "", "?")
+                        for c in composers
+                    )
+                    if has_real:
+                        ws_count = len(composers)
+                ws["_ws_count"] = ws_count
+                need_global.append(ws)
         except Exception:
             continue
+
+    if need_global:
+        global_counts = _count_global_conversations_batch(
+            [ws["path"] for ws in need_global]
+        )
+        for ws, g_count in zip(need_global, global_counts):
+            total = max(ws.pop("_ws_count", 0), g_count)
+            if total > 0:
+                ws["conversations"] = total
+                result.append(ws)
+
     return result
+
+
+def _count_global_conversations_batch(project_paths: list[str]) -> list[int]:
+    """Count conversations in globalStorage for multiple project paths.
+
+    Uses a single read-only connection (no file copy) so even a 1 GB
+    global DB is scanned in well under a second per path.
+    """
+    from . import db
+
+    global_db = get_global_db_path()
+    if not global_db.exists():
+        return [0] * len(project_paths)
+
+    counts = []
+    try:
+        with db.CursorDB(global_db, readonly=True) as cdb:
+            for path in project_paths:
+                target = os.path.normpath(os.path.expanduser(path))
+                rows = cdb.query(
+                    "SELECT COUNT(*) FROM cursorDiskKV "
+                    "WHERE key LIKE 'composerData:%' AND value LIKE ?",
+                    (f"%{target}%",),
+                )
+                counts.append(rows[0][0] if rows else 0)
+    except Exception:
+        return [0] * len(project_paths)
+    return counts
 
 
 def resolve_workspace(selector: str) -> Optional[dict]:

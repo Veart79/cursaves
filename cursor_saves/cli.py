@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, export, paths
+from . import __version__, db, export, paths
 from .importer import (
     copy_between_workspaces,
     find_snapshot_dir_for_project,
@@ -181,8 +181,12 @@ def _resolve_workspace_for_import(args) -> tuple[str, "Path | None"]:
 def _workspace_sync_summary(ws: dict) -> str:
     """Compute a short sync summary for a workspace.
 
-    Reads the workspace's conversations and checks each against snapshots.
-    Returns a string like "3 synced, 2 not pushed" or "5 synced".
+    Reads the workspace's allComposers list for fast enumeration, then
+    checks each conversation's push status. For stale workspaces where
+    allComposers is empty, the conversation count shown in the table
+    (from list_workspaces_with_conversations) is already correct — this
+    function just can't compute per-chat sync status without the full
+    list, so it returns a hint instead.
     """
     from . import db as _db
 
@@ -197,22 +201,29 @@ def _workspace_sync_summary(ws: dict) -> str:
     except Exception:
         return ""
 
-    if not data:
-        return ""
+    composers = []
+    if data:
+        composers = data.get("allComposers", [])
 
-    composers = data.get("allComposers", [])
-    if not composers:
-        return ""
+    has_real = any(
+        c.get("name") not in (None, "", "?")
+        for c in composers
+    )
+
+    if not has_real:
+        return "use 'list' for details"
 
     project_id = paths.get_project_identifier(ws["path"])
 
     counts = {"up_to_date": 0, "local_ahead": 0, "behind": 0, "never_pushed": 0}
-    for c in composers:
-        cid = c.get("composerId")
-        if not cid:
-            continue
-        status = get_push_status_for_conversation(cid, project_id)
-        counts[status] = counts.get(status, 0) + 1
+    global_db = paths.get_global_db_path()
+    with _db.CursorDB(global_db, readonly=True) as gcdb:
+        for c in composers:
+            cid = c.get("composerId")
+            if not cid:
+                continue
+            status = get_push_status_for_conversation(cid, project_id, _cdb=gcdb)
+            counts[status] = counts.get(status, 0) + 1
 
     parts = []
     if counts["up_to_date"]:
@@ -683,15 +694,17 @@ def _select_conversations(project_path: str, prompt: str = "push", workspace_dir
     print(f"  {'#':<4} {'Name':<36} {'Msgs':>5}  {'Last Updated':<20} {'Status'}")
     print(f"  {'-' * 95}")
 
-    for i, c in enumerate(conversations, 1):
-        name = c["name"]
-        if len(name) > 34:
-            name = name[:31] + "..."
-        status = get_push_status_for_conversation(c["id"], project_id)
-        status_label = format_sync_status(status)
-        print(
-            f"  {i:<4} {name:<36} {c['messageCount']:>5}  {c['lastUpdated']:<20} {status_label}"
-        )
+    global_db = paths.get_global_db_path()
+    with db.CursorDB(global_db, readonly=True) as gcdb:
+        for i, c in enumerate(conversations, 1):
+            name = c["name"]
+            if len(name) > 34:
+                name = name[:31] + "..."
+            status = get_push_status_for_conversation(c["id"], project_id, _cdb=gcdb)
+            status_label = format_sync_status(status)
+            print(
+                f"  {i:<4} {name:<36} {c['messageCount']:>5}  {c['lastUpdated']:<20} {status_label}"
+            )
 
     print(f"\n  Select chats to {prompt} (e.g. 1,3,5 or 1-3 or 'all') [all]:")
     try:

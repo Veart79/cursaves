@@ -530,8 +530,12 @@ def get_sync_status_for_snapshot(
 def get_push_status_for_conversation(
     composer_id: str,
     project_identifier: str,
+    _cdb: Optional[db.CursorDB] = None,
 ) -> str:
     """Check whether a local conversation has been pushed and if the snapshot is current.
+
+    Pass an open CursorDB via _cdb to avoid opening a new connection
+    per call (important when checking many conversations in a loop).
 
     Returns one of:
       "never_pushed"  - no snapshot exists for this conversation
@@ -544,7 +548,6 @@ def get_push_status_for_conversation(
     if not project_dir.exists():
         return "never_pushed"
 
-    # Look for a snapshot matching this composer ID
     meta_path = project_dir / f"{composer_id}.meta.json"
     if not meta_path.exists():
         return "never_pushed"
@@ -555,10 +558,16 @@ def get_push_status_for_conversation(
         return "never_pushed"
 
     snapshot_count = meta.get("messageCount", 0)
-    global_db_path = paths.get_global_db_path()
 
-    with db.CursorDB(global_db_path) as cdb:
-        local_data = cdb.get_json(f"composerData:{composer_id}")
+    own_cdb = _cdb is None
+    if own_cdb:
+        _cdb = db.CursorDB(paths.get_global_db_path(), readonly=True)
+
+    try:
+        local_data = _cdb.get_json(f"composerData:{composer_id}")
+    finally:
+        if own_cdb:
+            _cdb.close()
 
     if not local_data:
         return "never_pushed"
