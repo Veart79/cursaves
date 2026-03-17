@@ -51,7 +51,7 @@ This means you can sync chats for the same repo across different machines, even 
 
 ```bash
 # Install globally (once per machine)
-uv tool install git+https://github.com/Callum-Ward/cursaves.git
+uv tool install git+https://github.com/Veart79/cursaves.git
 
 # Initialize the sync repo (once per machine)
 cursaves init --remote git@github.com:you/my-cursaves.git
@@ -116,7 +116,7 @@ cadfb263-3326-4aff-8887-dcc12f736b11     Feedback on documentation...   agent   
 ### Install as a global CLI tool (recommended)
 
 ```bash
-uv tool install git+https://github.com/Callum-Ward/cursaves.git
+uv tool install git+https://github.com/Veart79/cursaves.git
 ```
 
 This puts `cursaves` on your PATH so you can run it from any directory. Run this on each machine you want to sync between.
@@ -132,7 +132,7 @@ uv tool upgrade cursaves
 ### Alternative: clone and run locally
 
 ```bash
-git clone git@github.com:Callum-Ward/cursaves.git
+git clone git@github.com:Veart79/cursaves.git
 cd cursaves
 uv sync
 uv run cursaves <command>

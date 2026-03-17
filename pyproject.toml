@@ -18,4 +18,4 @@ cursaves = "cursor_saves.cli:main"
 packages = ["cursor_saves"]
 
 [project.urls]
-Repository = "https://github.com/Callum-Ward/cursaves"
+Repository = "https://github.com/Veart79/cursaves"
