@@ -19,6 +19,7 @@ from .importer import (
     import_snapshot,
     list_snapshot_projects,
     list_snapshot_files,
+    move_workspace_chats,
     read_snapshot_file,
     read_snapshot_meta,
 )
@@ -1111,6 +1112,43 @@ def cmd_copy(args):
         print("Nothing done.")
 
 
+def cmd_move(args):
+    """Move chat registrations after renaming/moving a project directory."""
+    from .importer import is_cursor_running
+
+    old_path = os.path.normpath(os.path.expanduser(args.move_from))
+    new_path = os.path.normpath(os.path.expanduser(
+        args.move_to if args.move_to else paths.get_project_path()
+    ))
+
+    if old_path == new_path:
+        print("Source and target paths are the same.", file=sys.stderr)
+        return
+
+    if not getattr(args, "force", False) and is_cursor_running():
+        print(
+            "ERROR: Cursor is running. Cursor overwrites the sidebar DB on exit,\n"
+            "so changes made while it's running will be lost.\n"
+            "\n"
+            "  1. Close Cursor completely (Ctrl+Q / Cmd+Q)\n"
+            "  2. Run this command again\n"
+            "  3. Open Cursor\n"
+            "\n"
+            "Use --force to try anyway (will likely be overwritten).",
+            file=sys.stderr,
+        )
+        return
+
+    print(f"Moving chats: {old_path} → {new_path}\n")
+    moved = move_workspace_chats(old_path, new_path, force=True)
+
+    if moved > 0:
+        print(f"\nDone. {moved} chat(s) moved.")
+        print_reload_hint()
+    else:
+        print("No chats moved.")
+
+
 def cmd_status(args):
     """Show sync status -- what's local vs what's in snapshots."""
     _ensure_synced()  # Pull latest from remote first
@@ -1511,6 +1549,24 @@ def main():
     )
     p_copy.set_defaults(func=cmd_copy)
 
+    # ── move ──────────────────────────────────────────────────────
+    p_move = subparsers.add_parser(
+        "move", help="Move chats after renaming/moving a project directory"
+    )
+    p_move.add_argument(
+        "--from", dest="move_from", required=True,
+        help="Old project path (before the move)",
+    )
+    p_move.add_argument(
+        "--to", dest="move_to",
+        help="New project path (default: current directory)",
+    )
+    p_move.add_argument(
+        "--force", action="store_true",
+        help="Suppress the Cursor-running warning",
+    )
+    p_move.set_defaults(func=cmd_move)
+
     # ── status ──────────────────────────────────────────────────────
     p_status = subparsers.add_parser("status", help="Show sync status")
     add_project_args(p_status)
@@ -1548,9 +1604,10 @@ def main():
             "  pull                  Pull + import chats\n"
             "  pull -s               Select which snapshots to import\n"
             "\n"
-            "─── Copy between workspaces (same machine) ─────────────────────\n"
+            "─── Copy / move between workspaces (same machine) ────────────────\n"
             "\n"
             "  copy                  Copy chats between workspaces\n"
+            "  move --from <path>    Move chats after renaming a project dir\n"
             "\n"
             "─── Info & management ──────────────────────────────────────────\n"
             "\n"

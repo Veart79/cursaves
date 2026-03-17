@@ -183,11 +183,12 @@ All commands default to the current working directory as the project path. Use `
 | **`push`** | **Checkpoint + commit + push (the main command)** | No |
 | **`push -s`** | **Interactively select which conversations to push** | No |
 | **`pull`** | **Git pull + import snapshots** | Yes |
+| **`move`** | **Move chats after renaming/moving a project directory** | Yes |
 | `init` | Initialize the sync repo at ~/.cursaves/ | No |
 | `workspaces` | List all Cursor workspaces (local + SSH remote) | No |
 | `list` | Show conversations for a project | No |
 | `status` | Compare local conversations vs snapshots | No |
-| `reload` | Trigger Cursor to reload and pick up imported conversations | No |
+| `copy` | Copy chats between workspaces (same machine) | Yes |
 | `delete` | Delete cached snapshots (interactive, by ID, or all) | No |
 | `export <id>` | Export one conversation to a snapshot | No |
 | `checkpoint` | Export all conversations (no git) | No |
@@ -293,6 +294,32 @@ This also works with `-s` to selectively pick which conversations to copy, and w
 
 No remote repo is needed for this — `cursaves init` (without `--remote`) is enough for local-only use.
 
+### Moving chats after renaming a project directory
+
+Cursor binds chats to the **absolute path** of the project directory. If you rename or move the directory, chats disappear from the sidebar (the data is still in Cursor's database, but it can't find them).
+
+```bash
+# You moved ~/projects/myapp → ~/work/myapp
+# Chats are gone from the sidebar
+
+# Close Cursor first (required — Cursor overwrites the sidebar DB on exit)
+# Then in an external terminal:
+cursaves move --from ~/projects/myapp --to ~/work/myapp
+
+# Open Cursor — chats are back
+```
+
+`--to` defaults to the current directory, so from the new location you can just run:
+
+```bash
+cd ~/work/myapp
+cursaves move --from ~/projects/myapp
+```
+
+The command finds chats from old workspace sidebars and from the global database (fallback), re-registers them in the target workspace, and removes them from old workspaces.
+
+**Important:** `move` must be run while Cursor is **closed**. If Cursor is running, it will overwrite the sidebar database on exit and the moved chats will disappear again.
+
 ### SSH remote projects
 
 When you connect to a remote server via Cursor's SSH feature, **chats are stored on your local machine**, not on the remote server. This means:
@@ -358,6 +385,27 @@ cursaves/                      # Source repo (this repo, public)
 ```
 
 The tool code (this repo) is separate from your conversation data (`~/.cursaves/`). Install the tool once, point it at a private remote, and sync from any project directory.
+
+## Changelog (fork)
+
+### v0.6.0
+
+**New: `cursaves move` command**
+- Re-register chats in a new workspace after renaming/moving a project directory
+- Finds chats from both workspace sidebars and global DB (fallback)
+- Blocks execution when Cursor is running (changes would be overwritten)
+
+**Bug fixes:**
+- **`.code-workspace` support**: `find_workspace_dirs_for_project` and `list_all_workspaces` now match workspaces opened via `.code-workspace` files (previously only `folder` URIs were matched)
+- **Tilde expansion**: Workspace URIs containing `~` (e.g. `file://~/projects/foo`) are now resolved correctly via `expanduser`
+- **"identical" skip registration**: When importing a chat that already exists in the global DB ("already up to date"), the workspace sidebar registration is now performed anyway. Previously the chat was silently skipped, leaving it invisible in the sidebar
+- **`is_cursor_running()` on Linux**: The process is named `cursor` (lowercase) on Linux AppImage installs; previously only checked for `Cursor` (macOS)
+- **`find_or_create_workspace`**: Uses `expanduser` when creating new workspace URIs
+
+**Refactoring:**
+- Extracted `_extract_path_from_uri()` — shared URI parsing for `file://`, `vscode-remote://`, tilde expansion
+- Extracted `_ensure_workspace_registration()` — ensures sidebar registration on "identical"/"local_ahead" imports
+- Removed duplicated workspace registration code from `import_snapshot` — now uses shared `_register_in_workspace`
 
 ## Contributing
 

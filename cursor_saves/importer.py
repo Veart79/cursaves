@@ -104,16 +104,21 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
 def is_cursor_running() -> bool:
     """Check if the main Cursor app process is running.
 
-    Uses exact name match to avoid false positives from macOS system
-    services (CursorUIViewService) and lingering crash handlers.
+    On macOS the process is named "Cursor"; on Linux it may be "cursor"
+    (lowercase) when launched from an AppImage or shell wrapper.
     """
+    import platform
+    names = ["Cursor", "cursor"] if platform.system() == "Linux" else ["Cursor"]
     try:
-        result = subprocess.run(
-            ["pgrep", "-x", "Cursor"],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
+        for name in names:
+            result = subprocess.run(
+                ["pgrep", "-x", name],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return True
+        return False
     except FileNotFoundError:
         return False
 
@@ -152,8 +157,9 @@ def find_or_create_workspace(project_path: str) -> Path:
     ws_dir = ws_storage / ws_id
     ws_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create workspace.json
-    folder_uri = "file://" + os.path.normpath(project_path)
+    # Create workspace.json with fully resolved absolute path
+    abs_path = os.path.normpath(os.path.expanduser(project_path))
+    folder_uri = "file://" + abs_path
     ws_json = ws_dir / "workspace.json"
     ws_json.write_text(json.dumps({"folder": folder_uri}))
 
@@ -237,6 +243,26 @@ def _check_conflict(
         return "incoming_newer"
 
 
+def _ensure_workspace_registration(
+    composer_id: str,
+    composer_data: dict,
+    target_path: str,
+    target_workspace_dir: Optional[Path] = None,
+) -> None:
+    """Ensure the conversation is registered in the target workspace's sidebar.
+
+    Safe to call multiple times — skips if already registered.
+    Handles the case where data exists in global DB but workspace
+    registration was lost (e.g. Cursor overwrote DB on exit).
+    """
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+
+    _register_in_workspace(composer_id, composer_data, ws_dir)
+
+
 def import_snapshot(
     snapshot_path: Path,
     target_project_path: str,
@@ -309,10 +335,16 @@ def import_snapshot(
             f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
             f"snapshot has {snap_count} (local is newer, nothing to import)"
         )
+        _ensure_workspace_registration(
+            composer_id, composer_data, target_path, target_workspace_dir,
+        )
         return True
 
     if conflict == "identical":
         print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
+        _ensure_workspace_registration(
+            composer_id, composer_data, target_path, target_workspace_dir,
+        )
         return True
 
     if conflict == "new":
@@ -413,54 +445,7 @@ def import_snapshot(
         backup_path = db.backup_db(ws_db_path)
         print(f"  Backed up workspace DB to {backup_path.name}")
 
-    ws_cdb = db.CursorDB(ws_db_path)
-    try:
-        # Read existing composer list
-        existing = ws_cdb.get_json("composer.composerData", table="ItemTable")
-        if existing is None:
-            existing = {"allComposers": [], "selectedComposerIds": []}
-
-        # Check if this conversation is already registered
-        all_composers = existing.get("allComposers", [])
-        existing_ids = {c.get("composerId") for c in all_composers}
-
-        if composer_id not in existing_ids:
-            all_composers.append({
-                "type": "head",
-                "composerId": composer_id,
-                "lastUpdatedAt": composer_data.get("lastUpdatedAt", composer_data.get("createdAt", 0)),
-                "createdAt": composer_data.get("createdAt", 0),
-                "unifiedMode": composer_data.get("unifiedMode", "agent"),
-                "forceMode": composer_data.get("forceMode", ""),
-                "hasUnreadMessages": False,
-                "totalLinesAdded": composer_data.get("totalLinesAdded", 0),
-                "totalLinesRemoved": composer_data.get("totalLinesRemoved", 0),
-                "filesChangedCount": composer_data.get("filesChangedCount", 0),
-                "subtitle": composer_data.get("subtitle", ""),
-                "isArchived": False,
-                "isDraft": False,
-                "isWorktree": False,
-                "isSpec": False,
-                "isBestOfNSubcomposer": False,
-                "numSubComposers": len(composer_data.get("subComposerIds", [])),
-                "referencedPlans": [],
-                "name": composer_data.get("name", "Imported conversation"),
-            })
-            existing["allComposers"] = all_composers
-
-        # Set as selected so it shows up in the sidebar
-        selected = existing.get("selectedComposerIds", [])
-        if composer_id not in selected:
-            selected.append(composer_id)
-            existing["selectedComposerIds"] = selected
-
-        # Ensure migration flags are set (Cursor expects these)
-        existing.setdefault("hasMigratedComposerData", True)
-        existing.setdefault("hasMigratedMultipleComposers", True)
-
-        ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
-    finally:
-        ws_cdb.close()
+    _register_in_workspace(composer_id, composer_data, ws_dir)
 
     # ── Step 4: Verify writes ─────────────────────────────────────────
     verify_cdb = db.CursorDB(global_db_path)
@@ -868,6 +853,34 @@ def _register_in_workspace(
         ws_cdb.close()
 
 
+def _unregister_from_workspace(composer_ids: set[str], ws_dir: Path) -> int:
+    """Remove conversations from a workspace's sidebar.
+
+    Returns the number of conversations actually removed.
+    """
+    ws_db_path = ws_dir / "state.vscdb"
+    if not ws_db_path.exists():
+        return 0
+    ws_cdb = db.CursorDB(ws_db_path)
+    try:
+        existing = ws_cdb.get_json("composer.composerData", table="ItemTable")
+        if not existing:
+            return 0
+        before = len(existing.get("allComposers", []))
+        existing["allComposers"] = [
+            c for c in existing.get("allComposers", [])
+            if c.get("composerId") not in composer_ids
+        ]
+        existing["selectedComposerIds"] = [
+            cid for cid in existing.get("selectedComposerIds", [])
+            if cid not in composer_ids
+        ]
+        ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
+        return before - len(existing["allComposers"])
+    finally:
+        ws_cdb.close()
+
+
 def copy_between_workspaces(
     composer_ids: list[str],
     source_ws_dir: Path,
@@ -995,3 +1008,141 @@ def copy_between_workspaces(
         write_cdb.close()
 
     return success, failure
+
+
+# ── Workspace move (re-register after project directory rename) ────────
+
+
+def _find_chats_by_path_in_global_db(project_path: str) -> dict[str, dict]:
+    """Find conversations in global DB whose data contains the given path.
+
+    Returns {composerId: composerData} for all matching chats.
+    """
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return {}
+
+    target = os.path.normpath(os.path.expanduser(project_path))
+    result = {}
+    with db.CursorDB(global_db_path, readonly=True) as cdb:
+        rows = cdb.query(
+            "SELECT key, value FROM cursorDiskKV "
+            "WHERE key LIKE 'composerData:%' AND value LIKE ?",
+            (f"%{target}%",),
+        )
+        for key, value in rows:
+            cid = key.split(":", 1)[1]
+            try:
+                raw = value if isinstance(value, str) else value.decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                headers = data.get("fullConversationHeadersOnly", [])
+                if headers or data.get("name"):
+                    result[cid] = data
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    return result
+
+
+def move_workspace_chats(
+    old_path: str,
+    new_path: str,
+    force: bool = False,
+) -> int:
+    """Move chat registrations from old project path to new one.
+
+    Use after renaming/moving a project directory. Does NOT rewrite
+    paths inside chat data — only re-registers chats in the workspace
+    sidebar so they appear in Cursor.
+
+    Finds chats in two ways:
+    1. From old workspace sidebars (allComposers)
+    2. From global DB by path substring match (fallback when sidebars
+       are empty or already cleaned up)
+
+    Returns the number of chats moved.
+    """
+    if not force and is_cursor_running():
+        print(
+            "ERROR: Cursor is running. Cursor overwrites the sidebar DB on exit,\n"
+            "so changes made while it's running will be lost.\n"
+            "\n"
+            "  1. Close Cursor completely (Ctrl+Q / Cmd+Q)\n"
+            "  2. Run this command again\n"
+            "  3. Open Cursor\n"
+            "\n"
+            "Use --force to try anyway (will likely be overwritten).\n",
+            file=sys.stderr,
+        )
+        return 0
+
+    old_norm = os.path.normpath(os.path.expanduser(old_path))
+    new_norm = os.path.normpath(os.path.expanduser(new_path))
+
+    # Source 1: collect chats from old workspace sidebars
+    composer_data_map: dict[str, dict] = {}
+    old_ws_dirs = paths.find_workspace_dirs_for_project(old_path)
+    sidebar_ids: set[str] = set()
+    for ws_dir in old_ws_dirs:
+        ws_db_path = ws_dir / "state.vscdb"
+        if not ws_db_path.exists():
+            continue
+        with db.CursorDB(ws_db_path) as ws_cdb:
+            data = ws_cdb.get_json("composer.composerData", table="ItemTable")
+        if not data:
+            continue
+        for entry in data.get("allComposers", []):
+            cid = entry.get("composerId")
+            if cid:
+                sidebar_ids.add(cid)
+
+    # Read full composerData for sidebar chats
+    if sidebar_ids:
+        global_db_path = paths.get_global_db_path()
+        with db.CursorDB(global_db_path, readonly=True) as cdb:
+            for cid in sidebar_ids:
+                cd = cdb.get_json(f"composerData:{cid}")
+                if cd:
+                    composer_data_map[cid] = cd
+
+    # Source 2: scan global DB for chats referencing old_path
+    global_chats = _find_chats_by_path_in_global_db(old_norm)
+    for cid, cd in global_chats.items():
+        if cid not in composer_data_map:
+            composer_data_map[cid] = cd
+
+    if not composer_data_map:
+        print(
+            f"No chats found for '{old_path}'.\n"
+            f"Checked: workspace sidebars and global DB path search.",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Exclude chats that already belong to new_path (avoid pulling in
+    # chats that are legitimately in the target workspace)
+    if old_norm != new_norm:
+        new_path_chats = _find_chats_by_path_in_global_db(new_norm)
+        # Only exclude if a chat references new_path but NOT old_path
+        for cid in list(composer_data_map):
+            if cid in new_path_chats and cid not in sidebar_ids and cid not in global_chats:
+                del composer_data_map[cid]
+
+    # Register in the target workspace
+    target_ws_dir = find_or_create_workspace(new_path)
+    moved = 0
+    for cid, cd in composer_data_map.items():
+        name = cd.get("name") or "Untitled"
+        msgs = len(cd.get("fullConversationHeadersOnly", []))
+        if _register_in_workspace(cid, cd, target_ws_dir):
+            print(f"  Moved: {name} ({msgs} msgs)")
+            moved += 1
+        else:
+            print(f"  Failed: {name}", file=sys.stderr)
+
+    # Unregister from old workspaces
+    if old_ws_dirs:
+        all_ids = set(composer_data_map)
+        for ws_dir in old_ws_dirs:
+            _unregister_from_workspace(all_ids, ws_dir)
+
+    return moved

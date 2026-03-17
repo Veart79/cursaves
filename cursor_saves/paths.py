@@ -89,17 +89,33 @@ def _decode_ssh_host(host: str) -> str:
     return host
 
 
+def _extract_path_from_uri(uri: str) -> Optional[str]:
+    """Extract and normalize a filesystem path from a file:// or vscode-remote:// URI.
+
+    Returns the normalized absolute path, or None if the URI is not supported.
+    """
+    if uri.startswith("file://"):
+        path = uri[len("file://"):]
+        path = path.replace("%20", " ")
+        return os.path.normpath(os.path.expanduser(path))
+    elif uri.startswith("vscode-remote://"):
+        parts = uri.split("/", 3)
+        if len(parts) >= 4:
+            return os.path.normpath("/" + parts[3])
+    return None
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
     Scans workspace.json files in workspaceStorage/ to find matches.
+    Handles folder URIs, SSH remote URIs, and .code-workspace files.
     Returns list of workspace directory paths, newest first.
     """
     ws_storage = get_workspace_storage_dir()
     if not ws_storage.exists():
         return []
 
-    # Normalise the target path for comparison
     target = os.path.normpath(os.path.expanduser(project_path))
 
     matches = []
@@ -111,29 +127,24 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
-            if folder_uri.startswith("file://"):
-                folder_path = folder_uri[len("file://"):]
-                # URL-decode common escapes
-                folder_path = folder_path.replace("%20", " ")
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
-            else:
-                continue
 
-            if os.path.normpath(folder_path) == target:
-                matches.append(ws_dir)
+            folder_uri = data.get("folder", "")
+            if folder_uri:
+                folder_path = _extract_path_from_uri(folder_uri)
+                if folder_path and folder_path == target:
+                    matches.append(ws_dir)
+                    continue
+
+            workspace_uri = data.get("workspace", "")
+            if workspace_uri:
+                ws_file_path = _extract_path_from_uri(workspace_uri)
+                if ws_file_path:
+                    ws_file_dir = os.path.dirname(ws_file_path)
+                    if ws_file_dir == target:
+                        matches.append(ws_dir)
         except (json.JSONDecodeError, OSError):
             continue
 
-    # Sort by modification time, newest first
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches
 
@@ -181,43 +192,49 @@ def list_all_workspaces() -> list[dict]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            if not folder_uri:
-                continue
 
             ws_type = "local"
             host = None
             folder_path = ""
+            raw_uri = ""
 
-            if folder_uri.startswith("file://"):
-                folder_path = folder_uri[len("file://"):]
-                folder_path = folder_path.replace("%20", " ")
-            elif folder_uri.startswith("vscode-remote://"):
-                ws_type = "ssh"
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                authority = folder_uri.split("/")[2]  # ssh-remote%2B<host>
-                if "%2B" in authority:
-                    host = authority.split("%2B", 1)[1]
-                elif "+" in authority:
-                    host = authority.split("+", 1)[1]
-                # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
-                if host:
-                    host = _decode_ssh_host(host)
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
+            folder_uri = data.get("folder", "")
+            workspace_uri = data.get("workspace", "")
+
+            if folder_uri:
+                raw_uri = folder_uri
+                if folder_uri.startswith("file://"):
+                    folder_path = _extract_path_from_uri(folder_uri) or ""
+                elif folder_uri.startswith("vscode-remote://"):
+                    ws_type = "ssh"
+                    authority = folder_uri.split("/")[2]
+                    if "%2B" in authority:
+                        host = authority.split("%2B", 1)[1]
+                    elif "+" in authority:
+                        host = authority.split("+", 1)[1]
+                    if host:
+                        host = _decode_ssh_host(host)
+                    folder_path = _extract_path_from_uri(folder_uri) or ""
+                    if not folder_path:
+                        continue
+                else:
+                    continue
+            elif workspace_uri:
+                raw_uri = workspace_uri
+                ws_file_path = _extract_path_from_uri(workspace_uri)
+                if ws_file_path:
+                    folder_path = os.path.dirname(ws_file_path)
                 else:
                     continue
             else:
                 continue
 
-            # Get DB modification time
             db_path = ws_dir / "state.vscdb"
             mtime = db_path.stat().st_mtime if db_path.exists() else 0
 
             workspaces.append({
-                "folder_uri": folder_uri,
-                "path": os.path.normpath(folder_path),
+                "folder_uri": raw_uri,
+                "path": os.path.normpath(folder_path) if folder_path else "",
                 "type": ws_type,
                 "host": host,
                 "workspace_dir": ws_dir,
